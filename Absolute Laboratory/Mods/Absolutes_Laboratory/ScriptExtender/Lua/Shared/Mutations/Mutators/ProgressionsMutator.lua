@@ -1,0 +1,497 @@
+ProgressionsMutator = MutatorInterface:new("Progressions")
+
+function ProgressionsMutator:priority()
+	return self:recordPriority(SpellListMutator:priority() + 1)
+end
+
+function ProgressionsMutator:canBeAdditive()
+	return true
+end
+
+function ProgressionsMutator:handleDependencies()
+	-- NOOP
+end
+
+---@class ProgressionConditionalGroup
+---@field progressionTableIds {[Guid] : number}?
+---@field spellListDependencies Guid[]?
+---@field numberOfSpellLists number?
+
+---@class ProgressionsMutator : Mutator
+---@field values ProgressionConditionalGroup[]
+
+---@param mutator ProgressionsMutator
+function ProgressionsMutator:renderMutator(parent, mutator)
+	ProgressionProxy:buildProgressionIndex()
+
+	mutator.values = mutator.values or {}
+
+	Helpers:KillChildren(parent)
+
+	local popup = parent:AddPopup("")
+
+	local classTable = Styler:TwoColumnTable(parent)
+	classTable.ColumnDefs[1].Width = 20
+	classTable.BordersV = false
+	classTable.Resizable = false
+	classTable.Borders = false
+	classTable.BordersH = true
+
+	for i, progressionConditionalGroup in ipairs(mutator.values) do
+		local row = classTable:AddRow()
+
+		local delete = Styler:ImageButton(row:AddCell():AddImageButton("delete" .. mutator.targetProperty, "ico_red_x", { 16, 16 }))
+		delete.OnClick = function()
+			for x = i, TableUtils:CountElements(mutator.values) do
+				mutator.values[x].delete = true
+				mutator.values[x] = TableUtils:DeeplyCopyTable(mutator.values._real[x + 1])
+			end
+			Helpers:KillChildren(parent)
+			self:renderMutator(parent, mutator)
+		end
+
+		local groupCell = row:AddCell()
+		local conditionalGroupTable = groupCell:AddTable(tostring(i), 2)
+		conditionalGroupTable.Resizable = true
+
+		local progressionRow = conditionalGroupTable:AddRow()
+		local progressionDefCell = progressionRow:AddCell()
+
+		local function buildDisplayTable()
+			Helpers:KillChildren(progressionDefCell)
+
+			local groupTable = progressionDefCell:AddTable("", 2)
+			groupTable.SizingStretchSame = true
+
+			local headerRow = groupTable:AddRow()
+			headerRow.Headers = true
+			headerRow:AddCell():AddText("Progression Table")
+			headerRow:AddCell():AddText("Level % ( ? )"):Tooltip():AddText([[
+	What % of the selected entity's character level should be used when assigning progressions from this progression table (rounded as needed)
+e.g. if a progression table is set to 75% and the entity's level is 10, they will be assigned levels 1-7 from the given progrsesion
+Progressions are evaluated independently from one another to allow for progression stacking (i.e. to add Race and Class progressions)]])
+			if progressionConditionalGroup.progressionTableIds then
+				for progressionTableId, levelPercentage in TableUtils:OrderedPairs(progressionConditionalGroup.progressionTableIds, function(_, value)
+					return value
+				end) do
+					local groupRow = groupTable:AddRow()
+
+					---@type ResourceProgression
+					local progression = Ext.StaticData.Get(ProgressionProxy.progressionTableMappings[progressionTableId][1], "Progression")
+
+					local name = progression.Name
+
+					local progressionTableCell = groupRow:AddCell()
+					local deleteClass = Styler:ImageButton(progressionTableCell:AddImageButton("delete" .. progressionTableId, "ico_red_x", { 16, 16 }))
+					deleteClass.OnClick = function()
+						progressionConditionalGroup.progressionTableIds[progressionTableId] = nil
+						if TableUtils:CountElements(progressionConditionalGroup.progressionTableIds) ~= 0 then
+							for otherID, otherLevelPercentage in pairs(progressionConditionalGroup.progressionTableIds) do
+								if levelPercentage + otherLevelPercentage <= 100 then
+									progressionConditionalGroup.progressionTableIds[otherID] = otherLevelPercentage + levelPercentage
+									break
+								end
+							end
+						else
+							progressionConditionalGroup.progressionTableIds.delete = true
+						end
+
+						self:renderMutator(parent, mutator)
+					end
+
+					Styler:HyperlinkText(progressionTableCell, name, function(parent)
+						ResourceManager:RenderDisplayableValue(parent, progressionTableId, "Progression")
+					end).SameLine = true
+
+					local levelPercentageInput = groupRow:AddCell():AddInputInt("%", levelPercentage)
+					levelPercentageInput.IDContext = progressionTableId
+					levelPercentageInput.UserData = progressionTableId
+					levelPercentageInput.ItemWidth = 40
+					levelPercentageInput.SameLine = true
+
+					levelPercentageInput.OnDeactivate = function()
+						if levelPercentageInput.Value[1] < 0 then
+							levelPercentageInput.Value = { 0, 0, 0, 0 }
+						end
+
+						progressionConditionalGroup.progressionTableIds[progressionTableId] = levelPercentageInput.Value[1]
+
+						self:renderMutator(parent, mutator)
+					end
+				end
+			end
+		end
+
+		buildDisplayTable()
+
+		groupCell:AddButton("Add Progression Table").OnClick = function()
+			Helpers:KillChildren(popup)
+			popup:Open()
+
+			local input = popup:AddInputText("")
+			input.Hint = "Min 3 Characters"
+
+			local timer
+
+			local resultsGroup = popup:AddChildWindow("results")
+			resultsGroup.NoSavedSettings = true
+			resultsGroup.Size = { 0, 300 * Styler:ScaleFactor() }
+
+			input.OnChange = function()
+				if timer then
+					Ext.Timer.Cancel(timer)
+					timer = nil
+				end
+
+				Helpers:KillChildren(resultsGroup)
+
+				if #input.Text >= 3 then
+					timer = Ext.Timer.WaitFor(300, function()
+						local upperValue = input.Text:upper()
+
+						for tableUUID, name in TableUtils:OrderedPairs(ProgressionProxy.translationMap, function(key, value)
+							return value
+						end) do
+							if type(ProgressionProxy.progressionTableMappings[tableUUID]) == "table" then
+								if tableUUID:find(upperValue) or name:upper():find(upperValue) then
+									---@type ExtuiSelectable
+									local select = resultsGroup:AddSelectable(name, "DontClosePopups")
+									select.IDContext = tableUUID
+
+									local tooltipFunc = Styler:HyperlinkRenderable(select, name, "Shift", nil, nil, function(parent)
+										ResourceManager:RenderDisplayableValue(parent, tableUUID, "Progression")
+									end)
+
+									select.Selected = progressionConditionalGroup.progressionTableIds ~= nil and progressionConditionalGroup.progressionTableIds[tableUUID] ~= nil
+
+									select.OnClick = function()
+										if not tooltipFunc() then
+											-- This is flipped by the time this event fires
+											if not select.Selected then
+												progressionConditionalGroup.progressionTableIds[tableUUID] = nil
+											else
+												progressionConditionalGroup.progressionTableIds = progressionConditionalGroup.progressionTableIds or {}
+												progressionConditionalGroup.progressionTableIds[tableUUID] = 100
+											end
+											buildDisplayTable()
+										end
+									end
+								end
+							end
+						end
+
+						timer = nil
+					end)
+				end
+			end
+		end
+
+		local conditionalCell = progressionRow:AddCell()
+
+		local inputToPreventOffset = conditionalCell:AddInputInt("")
+		inputToPreventOffset:SetStyle("Alpha", 0)
+		inputToPreventOffset.ItemWidth = 0
+
+		conditionalCell:AddText("Must have been assigned ").SameLine = true
+		local spellListNumberInput = conditionalCell:AddInputInt("", progressionConditionalGroup.numberOfSpellLists or 0)
+		spellListNumberInput.ItemWidth = 40
+		spellListNumberInput.SameLine = true
+		spellListNumberInput.OnDeactivate = function()
+			if spellListNumberInput.Value[1] < 0 then
+				spellListNumberInput.Value = { 0, 0, 0, 0 }
+			end
+			progressionConditionalGroup.numberOfSpellLists = spellListNumberInput.Value[1]
+		end
+
+		conditionalCell:AddText(" or more of the following Spell Lists:").SameLine = true
+
+		if progressionConditionalGroup.spellListDependencies then
+			for i, spellListId in TableUtils:OrderedPairs(progressionConditionalGroup.spellListDependencies, function(key, value)
+				return MutationConfigurationProxy.lists.spellLists[value] and MutationConfigurationProxy.lists.spellLists[value].name or value
+			end) do
+				local spellList = MutationConfigurationProxy.lists.spellLists[spellListId]
+				if spellList then
+					local delete = Styler:ImageButton(conditionalCell:AddImageButton("delete" .. spellListId, "ico_red_x", { 16, 16 }))
+					delete.OnClick = function()
+						for x = i, TableUtils:CountElements(progressionConditionalGroup.spellListDependencies) do
+							progressionConditionalGroup.spellListDependencies[x] = progressionConditionalGroup.spellListDependencies[x + 1]
+						end
+
+						self:renderMutator(parent, mutator)
+					end
+
+					local spellListLink = conditionalCell:AddTextLink(spellList.name .. (spellList.modId and string.format(" (%s)", Ext.Mod.GetMod(spellList.modId).Info.Name) or ""))
+					spellListLink.IDContext = spellListId
+					spellListLink.SameLine = true
+					spellListLink.OnClick = function()
+						SpellListDesigner:launch(spellListId)
+					end
+				else
+					progressionConditionalGroup.spellListDependencies[i] = nil
+					TableUtils:ReindexNumericTable(progressionConditionalGroup.spellListDependencies)
+					self:renderMutator(parent, mutator)
+					return
+				end
+			end
+		end
+
+		conditionalCell:AddButton("Add Spell List").OnClick = function()
+			Helpers:KillChildren(popup)
+			popup:Open()
+
+			for spellListId, spellList in TableUtils:OrderedPairs(MutationConfigurationProxy.lists.spellLists, function(key, value)
+				return value.name .. (value.modId and string.format(" (%s)", Ext.Mod.GetMod(value.modId).Info.Name) or "")
+			end) do
+				---@type ExtuiSelectable
+				local select = popup:AddSelectable(spellList.name .. (spellList.modId and string.format(" (%s)", Ext.Mod.GetMod(spellList.modId).Info.Name) or ""))
+				select.Selected = TableUtils:IndexOf(progressionConditionalGroup.spellListDependencies, spellListId) ~= nil
+				select.OnClick = function()
+					-- selected is flipped by the time this fires
+					if not select.Selected then
+						for x = TableUtils:IndexOf(progressionConditionalGroup.spellListDependencies, spellListId), TableUtils:CountElements(progressionConditionalGroup.spellListDependencies) do
+							progressionConditionalGroup.spellListDependencies[x] = progressionConditionalGroup.spellListDependencies[x + 1]
+						end
+					else
+						progressionConditionalGroup.spellListDependencies = progressionConditionalGroup.spellListDependencies or {}
+						table.insert(progressionConditionalGroup.spellListDependencies, spellListId)
+					end
+					self:renderMutator(parent, mutator)
+				end
+			end
+		end
+	end
+
+	parent:AddButton("Add Progression Group").OnClick = function()
+		table.insert(mutator.values, {})
+		self:renderMutator(parent, mutator)
+	end
+end
+
+if Ext.IsServer() then
+	function ProgressionsMutator:undoMutator(entity, entityVar, primedEntityVar)
+		for _, progEntity in ipairs(Ext.Entity.GetAllEntitiesWithComponent("ProgressionMeta")) do
+			if progEntity.ProgressionMeta.Owner == entity then
+				Logger:BasicDebug("Destroyed progression %s", progEntity.ProgressionMeta.Progression)
+				Ext.Entity.Destroy(progEntity)
+			end
+		end
+
+		if not primedEntityVar or not primedEntityVar.appliedMutators[self.name] then
+			-- This will resync the original assigned progression from the character stat, from the level you specify up to the character level
+			Ext.System.ServerProgression.ProgressionUpdates[entity] = 1
+		end
+	end
+
+	---@type {[Guid]: Guid[]}
+	local progressionTableMappings = {}
+
+	local function buildProgressionIndex()
+		if not next(progressionTableMappings) then
+			for _, progressionId in pairs(Ext.StaticData.GetAll("Progression")) do
+				---@type ResourceProgression
+				local progression = Ext.StaticData.Get(progressionId, "Progression")
+
+				if progression and progression.ResourceUUID then
+					progressionTableMappings[progression.TableUUID] = progressionTableMappings[progression.TableUUID] or {}
+
+					table.insert(progressionTableMappings[progression.TableUUID], progression.ResourceUUID)
+				end
+			end
+
+			for _, progressions in pairs(progressionTableMappings) do
+				table.sort(progressions, function(a, b)
+					return Ext.StaticData.Get(a, "Progression").Level < Ext.StaticData.Get(b, "Progression").Level
+				end)
+			end
+		end
+	end
+	function ProgressionsMutator:applyMutator(entity, entityVar)
+		if Printer.TickHandler and (not next(Printer.TargetedEntities) or TableUtils:IndexOf(Printer.TargetedEntities, entity.Uuid.EntityUuid)) then
+			---@param entity EntityHandle
+			---@diagnostic disable-next-line: param-type-mismatch
+			Printer:RegisterEntitySubscription(Ext.Entity.OnChange("ProgressionContainer", function(entity)
+				ChangePrinter.logger:BasicDebug("[#%s]: %s - %s", Printer.FrameNo, Printer:GetEntityName(entity), entity.ProgressionContainer)
+			end, entity))
+		end
+
+		local progressionMutators = entityVar.appliedMutators[self.name]
+		if not progressionMutators[1] then
+			progressionMutators = { progressionMutators }
+		end
+		---@cast progressionMutators ProgressionsMutator[]
+
+		---@type ProgressionConditionalGroup[]
+		local chosenProgressionGroups = {}
+
+		for _, progressionMutator in ipairs(progressionMutators) do
+			for _, progressionConditonal in ipairs(progressionMutator.values) do
+				if progressionConditonal.progressionTableIds and next(progressionConditonal.progressionTableIds) then
+					if progressionConditonal.numberOfSpellLists and progressionConditonal.numberOfSpellLists > 0 then
+						if progressionConditonal.spellListDependencies and next(progressionConditonal.spellListDependencies) then
+							local numberMatched = 0
+							if entityVar.appliedMutators[SpellListMutator.name] and entityVar.appliedMutators[SpellListMutator.name].appliedLists then
+								for appliedSpellListId in pairs(entityVar.appliedMutators[SpellListMutator.name].appliedLists) do
+									if TableUtils:IndexOf(progressionConditonal.spellListDependencies, appliedSpellListId) then
+										numberMatched = numberMatched + 1
+									end
+								end
+							end
+
+							if numberMatched < progressionConditonal.numberOfSpellLists then
+								Logger:BasicDebug("Skipping a progression group because the number of matched spell lists, %s, is less than the defined minimum %s",
+									numberMatched,
+									progressionConditonal.numberOfSpellLists)
+
+								goto continue
+							end
+						else
+							Logger:BasicWarning("Skipping a Progressions Mutator spellList check because no spellLists were added to it despite specifying a number: %s",
+								progressionConditonal)
+						end
+					end
+					table.insert(chosenProgressionGroups, progressionConditonal)
+					::continue::
+				end
+			end
+		end
+
+		if next(chosenProgressionGroups) then
+			buildProgressionIndex()
+
+			Logger:BasicDebug("%s potential progression groups were identified - randomly choosing one", #chosenProgressionGroups)
+			---@type ProgressionConditionalGroup
+			local progressionGroup = chosenProgressionGroups[math.random(#chosenProgressionGroups)]
+
+			entityVar.originalValues[self.name] = {}
+			for i, list in ipairs(entity.ProgressionContainer.Progressions) do
+				entityVar.originalValues[self.name][i] = {}
+				for x, progEntity in ipairs(list) do
+					entityVar.originalValues[self.name][i][x] = Ext.Types.Serialize(progEntity.ProgressionMeta)
+					entityVar.originalValues[self.name][i][x].Owner = nil
+
+					Logger:BasicDebug("Destroyed original progression %s", progEntity.ProgressionMeta.Progression)
+					Ext.Entity.Destroy(progEntity)
+				end
+			end
+
+			entity.ProgressionContainer.Progressions = {}
+
+			for progressionTableId, levelPercentage in pairs(progressionGroup.progressionTableIds) do
+				local desiredLevel = math.max(1, math.ceil(entity.AvailableLevel.Level * (levelPercentage / 100)))
+				local lastLevel = 0
+				for _, progressionId in ipairs(progressionTableMappings[progressionTableId]) do
+					---@type ResourceProgression
+					local progression = Ext.StaticData.Get(progressionId, "Progression")
+
+					if progression.Level <= desiredLevel and progression.Level > lastLevel then
+						lastLevel = progression.Level
+						local prog = Ext.Entity.Create()
+
+						prog:CreateComponent("ServerReplicationDependency")
+						prog.ServerReplicationDependency.Dependency = entity
+
+						prog:CreateComponent("ProgressionMeta")
+
+						prog.ProgressionMeta.ClassLevel = (progression.ProgressionType == "Class" or progression.ProgressionType == "SubClass") and progression.Level or 0
+						prog.ProgressionMeta.Level = progression.Level
+						prog.ProgressionMeta.Owner = entity
+						prog.ProgressionMeta.Progression = progressionId
+						prog.ProgressionMeta.Source = "00000000-0000-0000-0000-000000000000"
+						prog.ProgressionMeta.SpellSourceType = "Progression"
+
+						prog:Replicate("ProgressionMeta")
+
+						-- Don't do this - assigning the owner or replication dependency (don't know which) automatically does this for us - otherwise we get it twice
+						-- entity.ProgressionContainer.Progressions[#entity.ProgressionContainer.Progressions + 1] = { prog }
+						Logger:BasicDebug("Assigned progression %s at level %s", progressionId, progression.Level)
+					end
+				end
+			end
+		end
+	end
+
+	function ProgressionsMutator:FinalizeMutator(entity)
+		return function()
+			-- Recomputes the boosts (i.e. action resources) specified in the progressions
+			Ext.System.ServerBoost.ProgressionUpdates[entity] = true
+		end
+	end
+end
+
+---@return MazzleDocsDocumentation
+function ProgressionsMutator:generateDocs()
+	return {
+		{
+			Topic = self.Topic,
+			SubTopic = self.SubTopic,
+			content = {
+				{
+					type = "Heading",
+					text = "Progressions",
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "CallOut",
+					prefix = "",
+					prefix_color = "Yellow",
+					text = [[
+Dependency On: Spell Lists
+Transient: No
+Composable: Yes - Progression groups will be grouped into one pool and randomly chosen from (post filtering)]]
+				} --[[@as MazzleDocsCallOut]],
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Summary"
+				},
+				{
+					type = "Content",
+					text = [[This is mutator allows you to change the Progressions associated to NPCs to enable, or avoid interfering with, your other mutators.]]
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Client-Side Content"
+				},
+				{
+					type = "Content",
+					text = [[
+As mentioned in the Spell Lists page, Spell Lists are intended to be for NPCs what Progressions are for Players - as such, I don't really recommend setting real Progressions for NPCs.
+This mutator is primarily intended to wipe progressions from NPCs by replacing them with useless ones, letting Lab take care of everything a progression would normally handle. Still, you can do what you want, it's your game.
+
+You add progressions by looking up the Name associated with a TableUUID - as TableUUIDs are arbitrary values with no backed resource, this is programmatically derived by Lab, using the first Name node asssociated to a progression with a given table id (so it may not be exactly what you think it is, especially with poorly modded/wackily designed progressions).
+
+Progressions can be set to a % of the character's level - these values do not have to add up to 100%, they are completely independent of each other, representing class/subclass/race/whatever progressions.
+They aren't directly tied to Spell Lists either, per the initial reasoning above, but you can conditionally apply a Progression group to an entity based on whether or not they've been assigned a certain number of specific lists, if you want to ensure your progressions adhere to the entity's assigned Archetype.
+
+The rest of the Mutator UI is explained via tooltips to avoid duplicated info and inevitable deprecation of information.]]
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Server-Side Implementation"
+				},
+				{
+					type = "Content",
+					text =
+					[[Progressions are one of the weirder components in the game - they aren't simple properties on an entity, they're actually entities in of themselves, associated to an entity via the Owner component, requiring Lab to create new entities that represent what's specified in the mutator.
+To prevent compounding bloat, Lab will destroy any progression entities it removes from a character entity, recreating them as necessary. I haven't seen any adverse impacts from doing this, but let me know.]]
+				},
+			}
+		}
+	} --[[@as MazzleDocsDocumentation]]
+end
+
+---@return {[string]: MazzleDocsContentItem}
+function ProgressionsMutator:generateChangelog()
+	return {
+	}
+end

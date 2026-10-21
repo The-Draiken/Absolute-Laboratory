@@ -1,0 +1,356 @@
+---@class TemplateSelectorClass : SelectorInterface
+TemplateSelector = SelectorInterface:new("Templates")
+
+---@class TemplateCriteria
+---@field id GUIDSTRING
+---@field includeChildren boolean
+
+---@class TemplateSelector : Selector
+---@field criteriaValue TemplateCriteria[]
+
+---@type Guid[]
+TemplateSelector.templates = {}
+---@type {[string] : string} template.Id : name and name : template.Id
+TemplateSelector.translationMap = {}
+---@type {[Guid]: Guid[]} parent : children
+TemplateSelector.childRelationships = {}
+
+function TemplateSelector:init()
+	if not next(self.templates) then
+		for _, template in pairs(Ext.ClientTemplate.GetAllRootTemplates()) do
+			if template.TemplateType == "character" and not string.find(template.Name, "Timeline") and not string.find(template.Name, "CINE") then
+				---@cast template CharacterTemplate
+
+				table.insert(self.templates, template.Id)
+				local name = template.Name
+				if self.translationMap[name] then
+					name = string.format("%s (%s)", name, template.Id:sub(-5))
+				end
+
+				if template.ParentTemplateId ~= "00000000-0000-0000-0000-000000000000" then
+					if not self.childRelationships[template.ParentTemplateId] then
+						self.childRelationships[template.ParentTemplateId] = {}
+					end
+					table.insert(self.childRelationships[template.ParentTemplateId], template.Id)
+				end
+
+				self.translationMap[template.Id] = name
+				self.translationMap[name] = template.Id
+			end
+		end
+		table.sort(self.templates, function(a, b)
+			return self.translationMap[a] < self.translationMap[b]
+		end)
+	end
+end
+
+---@param parent ExtuiWindow|ExtuiTableCell
+---@param templateId GUIDSTRING
+function TemplateSelector:displayChildTemplates(parent, templateId)
+	if self.childRelationships[templateId] then
+		local displayTable = Styler:TwoColumnTable(parent, "children" .. templateId)
+
+		for _, childId in TableUtils:OrderedPairs(self.childRelationships[templateId], function(key)
+			return self.translationMap[self.childRelationships[templateId][key]]
+		end) do
+			local row = displayTable:AddRow()
+			Styler:HyperlinkText(row:AddCell(), self.translationMap[childId], function(parent)
+				ResourceManager:RenderDisplayWindow(Ext.Template.GetTemplate(childId), parent)
+			end, true)
+			self:displayChildTemplates(row:AddCell(), childId)
+		end
+	end
+end
+
+---@param templateId GUIDSTRING
+---@param indent string?
+---@return string
+function TemplateSelector:buildChildTemplatesString(templateId, indent)
+	indent = indent or ""
+	local result = indent .. (indent ~= "" and "-- " or "") .. self.translationMap[templateId] .. "\n"
+	if self.childRelationships[templateId] then
+		for _, childId in TableUtils:OrderedPairs(self.childRelationships[templateId], function(key)
+			return self.translationMap[self.childRelationships[templateId][key]]
+		end) do
+			result = result .. self:buildChildTemplatesString(childId, indent .. string.rep(" ", 3) .. "|")
+		end
+	end
+	return result
+end
+
+---@param existingSelector TemplateSelector
+function TemplateSelector:renderSelector(parent, existingSelector)
+	self:init()
+
+	existingSelector.criteriaValue = existingSelector.criteriaValue or {}
+
+	local templateTree, updateFunc = Styler:DynamicLabelTree(parent:AddTree("Templates"))
+	templateTree:SetColor("Header", { 1, 1, 1, 0 })
+	templateTree.Disabled = false
+
+	local templateTable = Styler:TwoColumnTable(templateTree, "templates")
+	templateTable.Disabled = parent.Disabled
+	templateTable.ColumnDefs[1].Width = 300 * Styler:ScaleFactor()
+
+	local row = templateTable:AddRow()
+
+	local templateSelectCell = row:AddCell()
+
+	local templateSelectInput = templateSelectCell:AddInputText("")
+	templateSelectInput.EscapeClearsAll = true
+	templateSelectInput.AutoSelectAll = true
+
+	local infoText = templateSelectCell:AddText("( ? )")
+	infoText.SameLine = true
+	infoText:Tooltip():AddText("\t Hold shift before hovering to see tooltips")
+
+	local templateSelect = templateSelectCell:AddChildWindow("Templates")
+	templateSelect.NoSavedSettings = true
+	templateSelect.Size = Styler:ScaleFactor({ 0, 400 })
+
+	local templateDisplay = row:AddCell():AddChildWindow("TemplateDisplay")
+	templateDisplay.NoSavedSettings = true
+	templateDisplay.Size = Styler:ScaleFactor({ 0, 400 })
+
+
+	local function displaySelectedTemplates()
+		Helpers:KillChildren(templateDisplay)
+
+		for i, templateCriteria in TableUtils:OrderedPairs(existingSelector.criteriaValue, function(key)
+			return self.translationMap[existingSelector.criteriaValue[key].id]
+		end) do
+			local delete = Styler:ImageButton(templateDisplay:AddImageButton("delete" .. templateCriteria.id, "ico_red_x", { 16, 16 }))
+			delete.OnClick = function()
+				for x = i, TableUtils:CountElements(existingSelector.criteriaValue) do
+					existingSelector.criteriaValue[x].delete = true
+					if existingSelector.criteriaValue[x + 1] then
+						existingSelector.criteriaValue[x] = TableUtils:DeeplyCopyTable(existingSelector.criteriaValue._real[x + 1])
+					end
+				end
+
+				updateFunc(#existingSelector.criteriaValue)
+				displaySelectedTemplates()
+			end
+
+			if self.childRelationships[templateCriteria.id] then
+				local includeChildrenCheckbox = templateDisplay:AddCheckbox("##" .. templateCriteria.id, templateCriteria.includeChildren)
+				includeChildrenCheckbox.SameLine = true
+
+				includeChildrenCheckbox:Tooltip():AddText(
+					"\t Also select all entities whose template inherit from this template. Shift-click on this checkbox to see that list of children")
+
+				includeChildrenCheckbox.OnChange = function()
+					if Ext.ClientInput.GetInputManager().PressedModifiers == "Shift" then
+						local window = Ext.IMGUI.NewWindow("Child Templates for " .. self.translationMap[templateCriteria.id])
+						window.Closeable = true
+						window.AlwaysAutoResize = true
+						window:AddButton("Export tree to file").OnClick = function()
+							FileUtils:SaveStringContentToFile(self.translationMap[templateCriteria.id] .. ".txt", self:buildChildTemplatesString(templateCriteria.id))
+						end
+
+						self:displayChildTemplates(window, templateCriteria.id)
+						includeChildrenCheckbox.Checked = templateCriteria.includeChildren
+					else
+						templateCriteria.includeChildren = includeChildrenCheckbox.Checked
+					end
+				end
+			else
+				templateDisplay:AddDummy(38, 32).SameLine = true
+			end
+
+			Styler:HyperlinkText(templateDisplay, self.translationMap[templateCriteria.id] or templateCriteria.id, function(parent)
+				ResourceManager:RenderDisplayWindow(Ext.Template.GetTemplate(templateCriteria.id), parent)
+			end, true).SameLine = true
+		end
+	end
+
+	displaySelectedTemplates()
+	updateFunc(#existingSelector.criteriaValue)
+
+	local templateGroup = templateSelect:AddGroup("templateSelect")
+
+	---@param filter string?
+	local function buildSelects(filter)
+		Helpers:KillChildren(templateGroup)
+		if filter and #filter >= 3 then
+			for _, template in ipairs(self.templates) do
+				if not (filter and #filter > 0)
+					or string.upper(self.translationMap[template]):find(filter)
+					or string.upper(template):find(filter)
+				then
+					---@type ExtuiSelectable
+					local select = templateGroup:AddSelectable(self.translationMap[template] .. "##select")
+					select.UserData = template
+					select.Selected = TableUtils:IndexOf(existingSelector.criteriaValue, function(value)
+						return value.id == template
+					end) ~= nil
+					-- Header is also the main color property of the group, which is set to hide it, which gets inherited by its kids, so have to reset it
+					select:SetColor("Header", { 0.36, 0.30, 0.27, 0.76 })
+
+					local tooltip = select:Tooltip()
+					tooltip.Visible = false
+					select.OnHoverEnter = function()
+						if Ext.ClientInput.GetInputManager().PressedModifiers == "Shift" then
+							tooltip.Visible = true
+							ResourceManager:RenderDisplayWindow(Ext.Template.GetTemplate(template), tooltip)
+						end
+					end
+
+					select.OnHoverLeave = function()
+						tooltip.Visible = false
+						Helpers:KillChildren(tooltip)
+					end
+
+					select.OnClick = function()
+						if select.Selected then
+							table.insert(existingSelector.criteriaValue, {
+								id = template,
+								includeChildren = false
+							} --[[@as TemplateCriteria]])
+						else
+							local i = TableUtils:IndexOf(existingSelector.criteriaValue, function(value)
+								return value.id == template
+							end)
+
+							if i then
+								for x = i, TableUtils:CountElements(existingSelector.criteriaValue) do
+									existingSelector.criteriaValue[x].delete = true
+									existingSelector.criteriaValue[x] = TableUtils:DeeplyCopyTable(existingSelector.criteriaValue._real[x + 1])
+								end
+							end
+						end
+						displaySelectedTemplates()
+						updateFunc(#existingSelector.criteriaValue)
+					end
+				end
+			end
+		end
+	end
+	buildSelects()
+
+	templateSelectInput.OnChange = function()
+		buildSelects(Helpers:SanitizeStringForFind(templateSelectInput.Text):upper())
+	end
+	updateFunc(#existingSelector.criteriaValue)
+end
+
+---@param selector TemplateSelector
+function TemplateSelector:handleDependencies(_, selector, removeMissingDependencies)
+	for i, templateCriteria in ipairs(selector.criteriaValue) do
+		---@type CharacterTemplate
+		local characterTemplate = Ext.ClientTemplate.GetTemplate(templateCriteria.id)
+
+		if not characterTemplate then
+			selector.criteriaValue[i] = nil
+		elseif not removeMissingDependencies then
+			local fileName = characterTemplate.FileName:gsub("^.*[\\/]Mods[\\/]", ""):gsub("^.*[\\/]Public[\\/]", ""):match("([^/\\]+)")
+			fileName = fileName ~= "" and fileName or characterTemplate.FileName
+
+			if not TableUtils:IndexOf({ "Shared", "SharedDev", "Gustav" }, fileName) then
+				---@type ModuleInfo
+				local modInfo
+				for _, modId in pairs(Ext.Mod.GetLoadOrder()) do
+					local mod = Ext.Mod.GetMod(modId)
+					if fileName:find(mod.Info.Directory) then
+						modInfo = mod.Info
+						break
+					end
+				end
+
+				selector.modDependencies = selector.modDependencies or {}
+				if not selector.modDependencies[modInfo.ModuleUUID] then
+					selector.modDependencies[modInfo.ModuleUUID] = {
+						modName = modInfo.Name,
+						modAuthor = modInfo.Author,
+						modVersion = modInfo.ModVersion,
+						modId = modInfo.ModuleUUID,
+						packagedItems = {}
+					}
+
+					selector.modDependencies[modInfo.ModuleUUID].packagedItems[templateCriteria.id] = characterTemplate.DisplayName:Get() or characterTemplate.Name
+				end
+			end
+		end
+	end
+	TableUtils:ReindexNumericTable(selector.criteriaValue)
+end
+
+---@param charTemplate CharacterTemplate
+---@param templateToMatch GUIDSTRING
+---@return boolean?
+local function checkParent(charTemplate, templateToMatch, templateCache)
+	if charTemplate then
+		table.insert(templateCache, charTemplate.Id)
+
+		if charTemplate.Id == templateToMatch then
+			return true
+		elseif charTemplate.ParentTemplateId ~= "00000000-0000-0000-0000-000000000000" then
+			return checkParent(Ext.Template.GetTemplate(charTemplate.ParentTemplateId), templateToMatch, templateCache)
+		end
+	end
+end
+
+---@param selector TemplateSelector
+---@return fun(entity: EntityHandle|EntityRecord): boolean
+function TemplateSelector:predicate(selector)
+	return function(entity)
+		Ext.Utils.ProfileBegin("Template Selector")
+		local criteria = selector.criteriaValue
+
+		local parentTemplates = {}
+		if type(entity) == "userdata" then
+			---@cast entity EntityHandle
+			for _, templateCriteria in pairs(criteria) do
+				if entity.ServerCharacter.Template.Id == templateCriteria.id then
+					Ext.Utils.ProfileEnd("Template Selector")
+					return true
+				elseif templateCriteria.includeChildren then
+					if next(parentTemplates) then
+						if TableUtils:IndexOf(parentTemplates, templateCriteria.id) then
+							Ext.Utils.ProfileEnd("Template Selector")
+							return true
+						end
+					elseif entity.ServerCharacter.Template.ParentTemplateId ~= "00000000-0000-0000-0000-000000000000"
+						and checkParent(Ext.Template.GetTemplate(entity.ServerCharacter.Template.ParentTemplateId), templateCriteria.id, parentTemplates)
+					then
+						Ext.Utils.ProfileEnd("Template Selector")
+						return true
+					end
+				end
+			end
+		else
+			---@cast entity EntityRecord
+			for _, templateCriteria in pairs(criteria) do
+				if entity.Template == templateCriteria.id then
+					Ext.Utils.ProfileEnd("Template Selector")
+					return true
+				elseif templateCriteria.includeChildren then
+					if next(parentTemplates) then
+						if TableUtils:IndexOf(parentTemplates, templateCriteria.id) then
+							Ext.Utils.ProfileEnd("Template Selector")
+							return true
+						end
+					else
+						local charTemplate = Ext.Template.GetTemplate(entity.Template)
+						if charTemplate and charTemplate.ParentTemplateId ~= "00000000-0000-0000-0000-000000000000"
+							and checkParent(Ext.Template.GetTemplate(charTemplate.ParentTemplateId), templateCriteria.id, parentTemplates)
+						then
+							Ext.Utils.ProfileEnd("Template Selector")
+							return true
+						end
+					end
+				end
+			end
+		end
+
+		Ext.Utils.ProfileEnd("Template Selector")
+		return false
+	end
+end
+
+function TemplateSelector:cleanup()
+	-- NOOP
+end
+
+function TemplateSelector:generateDocs()
+end

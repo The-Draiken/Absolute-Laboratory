@@ -1,0 +1,371 @@
+FactionSelector = SelectorInterface:new("Factions")
+
+---@class FactionCriteria
+---@field id GUIDSTRING
+---@field includeChildren boolean
+
+---@class FactionSelector : Selector
+---@field criteriaValue FactionCriteria[]
+
+local factions = {}
+local translationMap = {}
+local childRelationships = {}
+
+local function init()
+	if not next(factions) then
+		for _, factionId in pairs(Ext.StaticData.GetAll("Faction")) do
+			---@type ResourceFaction
+			local faction = Ext.StaticData.Get(factionId, "Faction")
+
+			table.insert(factions, factionId)
+			local name = faction.Faction
+			if translationMap[name] then
+				name = string.format("%s (%s)", name, factionId:sub(-5))
+			end
+
+			if faction.ParentGuid ~= "00000000-0000-0000-0000-000000000000" then
+				if not childRelationships[faction.ParentGuid] then
+					childRelationships[faction.ParentGuid] = {}
+				end
+				table.insert(childRelationships[faction.ParentGuid], factionId)
+			end
+
+			translationMap[factionId] = name
+			translationMap[name] = factionId
+		end
+		table.sort(factions, function(a, b)
+			return translationMap[a] < translationMap[b]
+		end)
+	end
+end
+
+---@param parent ExtuiWindow|ExtuiTableCell
+---@param factionId GUIDSTRING
+local function displayChildFactions(parent, factionId)
+	if childRelationships[factionId] then
+		local displayTable = Styler:TwoColumnTable(parent, "children" .. factionId)
+
+		for _, childId in TableUtils:OrderedPairs(childRelationships[factionId], function(key)
+			return translationMap[childRelationships[factionId][key]]
+		end) do
+			local row = displayTable:AddRow()
+			Styler:HyperlinkText(row:AddCell(), translationMap[childId], function(parent)
+				ResourceManager:RenderDisplayWindow(Ext.StaticData.Get(childId, "Faction"), parent)
+			end, true)
+			displayChildFactions(row:AddCell(), childId)
+		end
+	end
+end
+
+---@param factionId GUIDSTRING
+---@param indent string?
+---@return string
+local function buildChildFactionsString(factionId, indent)
+	indent = indent or ""
+	local result = indent .. (indent ~= "" and "-- " or "") .. translationMap[factionId] .. "\n"
+	if childRelationships[factionId] then
+		for _, childId in TableUtils:OrderedPairs(childRelationships[factionId], function(key)
+			return translationMap[childRelationships[factionId][key]]
+		end) do
+			result = result .. buildChildFactionsString(childId, indent .. string.rep(" ", 3) .. "|")
+		end
+	end
+	return result
+end
+
+---@param existingSelector FactionSelector
+function FactionSelector:renderSelector(parent, existingSelector)
+	init()
+
+	existingSelector.criteriaValue = existingSelector.criteriaValue or {}
+
+	local factionTree, updateFunc = Styler:DynamicLabelTree(parent:AddTree("Factions"))
+	factionTree.Disabled = false
+	factionTree:SetColor("Header", { 1, 1, 1, 0 })
+
+	local factionTable = Styler:TwoColumnTable(factionTree, "factions")
+	factionTable.Disabled = parent.Disabled
+	factionTable.ColumnDefs[1].Width = 300 * Styler:ScaleFactor()
+
+	local row = factionTable:AddRow()
+
+	local factionSelectCell = row:AddCell()
+
+	local factionSelectInput = factionSelectCell:AddInputText("")
+	factionSelectInput.EscapeClearsAll = true
+	factionSelectInput.AutoSelectAll = true
+
+	local infoText = factionSelectCell:AddText("( ? )")
+	infoText.SameLine = true
+	infoText:Tooltip():AddText("\t Hold shift before hovering to see tooltips")
+
+	local factionSelect = factionSelectCell:AddChildWindow("Factions")
+	factionSelect.NoSavedSettings = true
+	factionSelect.Size = Styler:ScaleFactor({ 0, 400 })
+
+	local factionDisplay = row:AddCell():AddChildWindow("FactionDisplay")
+	factionDisplay.NoSavedSettings = true
+	factionDisplay.Size = Styler:ScaleFactor({ 0, 400 })
+
+	local function displaySelectedFactions()
+		Helpers:KillChildren(factionDisplay)
+
+		for i, factionCriteria in TableUtils:OrderedPairs(existingSelector.criteriaValue, function(key)
+			return translationMap[existingSelector.criteriaValue[key].id]
+		end) do
+			local delete = Styler:ImageButton(factionDisplay:AddImageButton("delete" .. factionCriteria.id, "ico_red_x", { 16, 16 }))
+			delete.OnClick = function()
+				for x = i, TableUtils:CountElements(existingSelector.criteriaValue) do
+					existingSelector.criteriaValue[x].delete = true
+					if existingSelector.criteriaValue[x + 1] then
+						existingSelector.criteriaValue[x] = TableUtils:DeeplyCopyTable(existingSelector.criteriaValue[x + 1]._real)
+					end
+				end
+
+				updateFunc(#existingSelector.criteriaValue)
+				displaySelectedFactions()
+			end
+
+			if childRelationships[factionCriteria.id] then
+				local includeChildrenCheckbox = factionDisplay:AddCheckbox("##" .. factionCriteria.id, factionCriteria.includeChildren)
+				includeChildrenCheckbox.SameLine = true
+
+				includeChildrenCheckbox:Tooltip():AddText(
+					"\t Also select all entities whose faction inherit from this faction. Shift-click on this checkbox to see that list of children")
+
+				includeChildrenCheckbox.OnChange = function()
+					if Ext.ClientInput.GetInputManager().PressedModifiers == "Shift" then
+						local window = Ext.IMGUI.NewWindow("Child Factions for " .. translationMap[factionCriteria.id])
+						window.Closeable = true
+						window.AlwaysAutoResize = true
+						window:AddButton("Export tree to file").OnClick = function()
+							FileUtils:SaveStringContentToFile(translationMap[factionCriteria.id] .. ".txt", buildChildFactionsString(factionCriteria.id))
+						end
+
+						displayChildFactions(window, factionCriteria.id)
+						includeChildrenCheckbox.Checked = factionCriteria.includeChildren
+					else
+						factionCriteria.includeChildren = includeChildrenCheckbox.Checked
+					end
+				end
+			else
+				factionDisplay:AddDummy(38, 32).SameLine = true
+			end
+
+			Styler:HyperlinkText(factionDisplay, translationMap[factionCriteria.id], function(parent)
+				ResourceManager:RenderDisplayWindow(Ext.StaticData.Get(factionCriteria.id, "Faction"), parent)
+			end, true).SameLine = true
+		end
+	end
+
+	displaySelectedFactions()
+	updateFunc(#existingSelector.criteriaValue)
+
+	local factionGroup = factionSelect:AddGroup("factionSelect")
+
+	---@param filter string?
+	local function buildSelects(filter)
+		Helpers:KillChildren(factionGroup)
+		-- if filter and #filter >= 2 then
+		for _, faction in ipairs(factions) do
+			if not (filter and #filter > 0)
+				or string.upper(translationMap[faction]):find(filter)
+				or string.upper(faction):find(filter)
+			then
+				---@type ExtuiSelectable
+				local select = factionGroup:AddSelectable(translationMap[faction] .. "##select")
+				select.UserData = faction
+				select.Selected = TableUtils:IndexOf(existingSelector.criteriaValue, function(value)
+					return value.id == faction
+				end) ~= nil
+				-- Header is also the main color property of the group, which is set to hide it, which gets inherited by its kids, so have to reset it
+				select:SetColor("Header", { 0.36, 0.30, 0.27, 0.76 })
+
+				local tooltip = select:Tooltip()
+				tooltip.Visible = false
+				select.OnHoverEnter = function()
+					if Ext.ClientInput.GetInputManager().PressedModifiers == "Shift" then
+						tooltip.Visible = true
+						ResourceManager:RenderDisplayWindow(Ext.StaticData.Get(faction, "Faction"), tooltip)
+					end
+				end
+
+				select.OnHoverLeave = function()
+					tooltip.Visible = false
+					Helpers:KillChildren(tooltip)
+				end
+
+				select.OnClick = function()
+					if select.Selected then
+						table.insert(existingSelector.criteriaValue, {
+							id = faction,
+							includeChildren = false
+						} --[[@as FactionCriteria]])
+					else
+						local i = TableUtils:IndexOf(existingSelector.criteriaValue, function(value)
+							return value.id == faction
+						end)
+						if i then
+							for x = i, TableUtils:CountElements(existingSelector.criteriaValue) do
+								existingSelector.criteriaValue[x].delete = true
+								existingSelector.criteriaValue[x] = TableUtils:DeeplyCopyTable(existingSelector.criteriaValue._real[x + 1])
+							end
+						end
+					end
+					displaySelectedFactions()
+					updateFunc(#existingSelector.criteriaValue)
+				end
+			end
+			-- end
+		end
+	end
+	buildSelects()
+
+	factionSelectInput.OnChange = function()
+		buildSelects(Helpers:SanitizeStringForFind(factionSelectInput.Text):upper())
+	end
+	updateFunc(#existingSelector.criteriaValue)
+end
+
+---@param selector FactionSelector
+function FactionSelector:handleDependencies(_, selector, removeMissingDependencies)
+	local factionSources = Ext.StaticData.GetSources("Faction")
+
+	for i, faction in ipairs(selector.criteriaValue) do
+		---@type ResourceFaction
+		local factionData = Ext.StaticData.Get(faction.id, "Faction")
+
+		if not factionData then
+			selector.criteriaValue[i] = nil
+		elseif not removeMissingDependencies then
+			local factionSource = TableUtils:IndexOf(factionSources, function(value)
+				return TableUtils:IndexOf(value, faction.id) ~= nil
+			end)
+
+			if factionSource then
+				selector.modDependencies = selector.modDependencies or {}
+				if not selector.modDependencies[factionSource] then
+					local name, author, version = Helpers:BuildModFields(factionSource)
+					if author == "Larian" then
+						goto continue
+					end
+					selector.modDependencies[factionSource] = {
+						modName = name,
+						modAuthor = author,
+						modVersion = version,
+						modId = factionSource,
+						packagedItems = {}
+					}
+				end
+
+				selector.modDependencies[factionSource].packagedItems[faction.id] = factionData.Faction
+			end
+		end
+		::continue::
+	end
+
+	TableUtils:ReindexNumericTable(selector.criteriaValue)
+end
+
+---@type {[string]: string[]} Parent : children
+local factionHierarchyCache = nil
+
+---@param charFaction ResourceFaction
+---@param children string[]
+---@return boolean?
+local function indexHierarchy(charFaction, children)
+	if charFaction then
+		factionHierarchyCache[charFaction.ResourceUUID] = TableUtils:DeeplyCopyTable(children)
+
+		table.insert(children, charFaction.ResourceUUID)
+
+		if charFaction.ParentGuid ~= "00000000-0000-0000-0000-000000000000" then
+			if not factionHierarchyCache[charFaction.ParentGuid] then
+				indexHierarchy(Ext.StaticData.Get(charFaction.ParentGuid, "Faction"), children)
+			else
+				for _, child in ipairs(children) do
+					table.insert(factionHierarchyCache[charFaction.ParentGuid], child)
+				end
+			end
+		end
+
+		if not next(factionHierarchyCache[charFaction.ResourceUUID]) then
+			factionHierarchyCache[charFaction.ResourceUUID] = nil
+		end
+	end
+end
+
+---@param selector FactionSelector
+---@return fun(entity: EntityHandle|EntityRecord): boolean
+function FactionSelector:predicate(selector)
+	local function hydrateCache()
+		factionHierarchyCache = factionHierarchyCache or {}
+
+		if not next(factionHierarchyCache) then
+			Ext.Utils.ProfileBegin("Generating Faction Hierarchy Cache")
+			for _, factionId in pairs(Ext.StaticData.GetAll("Faction")) do
+				if not factionHierarchyCache[factionId] then
+					indexHierarchy(Ext.StaticData.Get(factionId, "Faction"), {})
+				end
+			end
+
+			Ext.Utils.ProfileEnd("Generating Faction Hierarchy Cache")
+		end
+	end
+
+	return function(entity)
+		Ext.Utils.ProfileBegin("Faction Selector")
+		local criteria = selector.criteriaValue
+
+		if type(entity) == "userdata" then
+			---@cast entity EntityHandle
+			for _, factionCriteria in pairs(criteria) do
+				if entity.Faction.field_8 == factionCriteria.id then
+					Ext.Utils.ProfileEnd("Faction Selector")
+					return true
+				elseif factionCriteria.includeChildren then
+					hydrateCache()
+
+					if TableUtils:IndexOf(factionHierarchyCache[entity.Faction.field_8], factionCriteria.id) then
+						Ext.Utils.ProfileEnd("Faction Selector")
+						return true
+					else
+						Ext.Utils.ProfileEnd("Faction Selector")
+						return false
+					end
+				end
+			end
+		else
+			---@cast entity EntityRecord
+			for _, factionCriteria in pairs(criteria) do
+				if entity.Faction == factionCriteria.id then
+					Ext.Utils.ProfileEnd("Faction Selector")
+					return true
+				elseif factionCriteria.includeChildren then
+					hydrateCache()
+
+					if factionHierarchyCache[entity.Faction]
+						and TableUtils:IndexOf(factionHierarchyCache[entity.Faction], factionCriteria.id)
+					then
+						Ext.Utils.ProfileEnd("Faction Selector")
+						return true
+					else
+						Ext.Utils.ProfileEnd("Faction Selector")
+						return false
+					end
+				end
+			end
+		end
+
+		Ext.Utils.ProfileEnd("Faction Selector")
+		return false
+	end
+end
+
+function FactionSelector:cleanup()
+	-- Intentionally kept between passes - it's built purely from static Faction data, and clearing it here meant
+	-- re-walking every Faction in the game at the start of every Combat Only fight
+end
+
+function FactionSelector:generateDocs()
+end

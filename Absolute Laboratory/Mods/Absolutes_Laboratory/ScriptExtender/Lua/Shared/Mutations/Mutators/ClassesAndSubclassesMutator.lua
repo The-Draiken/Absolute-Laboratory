@@ -1,0 +1,935 @@
+---@class ClassesAndSubclassesMutatorClass : MutatorInterface
+ClassesAndSubclassesMutator = MutatorInterface:new("Classes And Subclasses")
+ClassesAndSubclassesMutator.affectedComponents = {
+	"Classes",
+	"Stats"
+}
+
+function ClassesAndSubclassesMutator:priority()
+	return self:recordPriority(SpellListMutator:priority() + 1)
+end
+
+function ClassesAndSubclassesMutator:canBeAdditive()
+	return true
+end
+
+function ClassesAndSubclassesMutator:Transient()
+	return false
+end
+
+---@type {[Guid]: (Guid[]|Guid)}
+ClassesAndSubclassesMutator.progressionTableMappings = {}
+
+function ClassesAndSubclassesMutator:buildProgressionIndex()
+	if not next(self.progressionTableMappings) then
+		for _, progressionId in pairs(Ext.StaticData.GetAll("Progression")) do
+			---@type ResourceProgression
+			local progression = Ext.StaticData.Get(progressionId, "Progression")
+
+			if progression and progression.ResourceUUID then
+				self.progressionTableMappings[progression.ResourceUUID] = progression.TableUUID
+				self.progressionTableMappings[progression.TableUUID] = self.progressionTableMappings[progression.TableUUID] or {}
+
+				if type(self.progressionTableMappings[progression.TableUUID]) == "table" then
+					table.insert(self.progressionTableMappings[progression.TableUUID], progression.ResourceUUID)
+				elseif progression.TableUUID ~= "00000000-0000-0000-0000-000000000000" then
+					Logger:BasicWarning("Progression TableUUID %s on progression %s (%s) is the same as a previously registered ResourceUUID - not sure how?",
+						progression.TableUUID,
+						progression.ResourceUUID,
+						progression.Name)
+				end
+			end
+		end
+
+		for _, progressions in pairs(self.progressionTableMappings) do
+			if type(progressions) == "table" then
+				table.sort(progressions, function(a, b)
+					return Ext.StaticData.Get(a, "Progression").Level < Ext.StaticData.Get(b, "Progression").Level
+				end)
+			end
+		end
+	end
+end
+
+if Ext.IsClient() then
+	Ext.Events.StatsLoaded:Subscribe(function(e)
+		---@class AuthorSubclass
+		---@field modGuid string
+		---@field subClassGuid string
+		---@field class string
+
+		local cfIsLoaded = Ext.Mod.IsModLoaded("67fbbd53-7c7d-4cfa-9409-6d737b4d92a9")
+
+		local variants = ConfigurationStructure.config.mutations.settings.classesAndSubclassesDefaultVariants
+		for _, classDescId in TableUtils:OrderedPairs(Ext.StaticData.GetAll("ClassDescription"), function(key, value)
+			---@type ResourceClassDescription
+			local classDesc = Ext.StaticData.Get(value, "ClassDescription")
+
+			return classDesc.ParentGuid == "00000000-0000-0000-0000-000000000000" and 0 or 1
+		end) do
+			if not variants.vanillaToVariants[classDescId] or not Ext.StaticData.Get(variants.vanillaToVariants[classDescId], "ClassDescription") then
+				---@type ResourceClassDescription
+				local classDescription = Ext.StaticData.Get(classDescId, "ClassDescription")
+
+				local succeed, error = pcall(function(...)
+					---@type ResourceClassDescription
+					local newClassDesc = Ext.StaticData.Create("ClassDescription", variants.vanillaToVariants[classDescId])
+
+					---@type ResourceClassDescription
+					local classDescCopy = Ext.Types.Serialize(classDescription)
+					classDescCopy.ResourceUUID = newClassDesc.ResourceUUID
+					classDescCopy.BaseHp = 0
+					classDescCopy.HpPerLevel = 0
+					classDescCopy.DisplayName.Handle.Handle = "Lab_Variant_" .. classDescCopy.ResourceUUID .. "_Name"
+					classDescCopy.ProgressionTableUUID = "00000000-0000-0000-0000-000000000000"
+					classDescCopy.CanLearnSpells = false
+					classDescCopy.IsDefaultForUseSpellAction = false
+
+					if variants.vanillaToVariants[classDescCopy.ParentGuid] then
+						classDescCopy.ParentGuid = variants.vanillaToVariants[classDescCopy.ParentGuid]
+					end
+
+					Ext.Loca.UpdateTranslatedString(classDescCopy.DisplayName.Handle.Handle, (classDescription.DisplayName:Get() or classDescription.Name) .. " (NPC)")
+
+					Ext.Types.Unserialize(newClassDesc, classDescCopy)
+
+					if cfIsLoaded and classDescription.ParentGuid ~= "00000000-0000-0000-0000-000000000000" then
+						ClassesAndSubclassesMutator:buildProgressionIndex()
+
+						---@type ResourceClassDescription?
+						local parentClass = Ext.StaticData.Get(classDescription.ParentGuid, "ClassDescription")
+
+						local class = {
+							["Lab" .. classDescCopy.Name] = {
+								class = parentClass and parentClass.Name:lower() or classDescription.ProgressionTableUUID,
+								subClassGuid = classDescCopy.ResourceUUID,
+								modGuid = ModuleUUID
+							} --[[@as AuthorSubclass]]
+						}
+
+						local success, error = xpcall(function(...)
+							if parentClass then
+								local parentProgressionIdWithSubclass
+								for _, progressionId in pairs(ClassesAndSubclassesMutator.progressionTableMappings[parentClass.ProgressionTableUUID]) do
+									Logger:BasicDebug("Checking progression %s for parent progression %s", progressionId, parentClass.ResourceUUID)
+									---@type ResourceProgression
+									local progression = Ext.StaticData.Get(progressionId, "Progression")
+
+									if progression.SubClasses and #progression.SubClasses > 0 then
+										parentProgressionIdWithSubclass = progression.ResourceUUID
+										break
+									end
+								end
+
+								if parentProgressionIdWithSubclass then
+									Logger:BasicDebug("Inserting Class %s with parent progression id %s",
+										parentClass and parentClass.Name:lower() or classDescription.ProgressionTableUUID, parentProgressionIdWithSubclass)
+
+									Mods.SubclassCompatibilityFramework.Api.InsertClass(parentClass and parentClass.Name:lower() or classDescription.ProgressionTableUUID,
+										parentProgressionIdWithSubclass)
+								end
+							end
+							Mods.SubclassCompatibilityFramework.Api.RemoveSubClasses(class)
+						end, debug.traceback)
+
+						if not success then
+							if Logger:IsLogLevelEnabled(Logger.PrintTypes.TRACE) then
+								local modId = TableUtils:IndexOf(Ext.StaticData.GetSources("ClassDescription"), function(value)
+									return TableUtils:IndexOf(value, classDescription.ResourceUUID) ~= nil
+								end)
+
+								local errorTable = {
+									originalSubclass = Ext.Types.Serialize(classDescription),
+									variantSubclass = classDescCopy,
+									parentClass = Ext.Types.Serialize(parentClass),
+									sourceMod = modId and Ext.Types.Serialize(Ext.Mod.GetMod(modId)),
+									["error"] = error,
+									["cfRequestObject"] = class
+								}
+								FileUtils:SaveTableToFile(classDescCopy.Name .. ".json", errorTable)
+							end
+							Logger:BasicWarning(
+								"(Known issue with CF, do not report until you see an appropriate update from CF and this still happens) - Subclass %s could not be removed by CF due to error %s - full entry is\n%s",
+								classDescription.Name, error, class)
+						end
+					end
+
+					if not variants.vanillaToVariants[classDescId] then
+						variants.vanillaToVariants[classDescId] = classDescCopy.ResourceUUID
+						if variants.nameGuidMap[classDescription.Name] then
+							Logger:BasicWarning("Class %s (%s - %s) wasn't mapped yet, but has its name registered - this likely means it's a duplicate class to %s?",
+								classDescription.Name,
+								classDescription.DisplayName:Get(),
+								classDescription.ResourceUUID,
+								variants.nameGuidMap[classDescription.Name])
+						else
+							variants.nameGuidMap[classDescription.Name] = classDescId
+						end
+					end
+				end)
+				if not succeed then
+					Logger:BasicWarning("Could not create an NPC variant of %s (GUID [%s]) due to error %s", classDescription.Name, classDescription.ResourceUUID, error)
+				else
+					Logger:BasicDebug("Created NPC Variant of class %s (GUID [%s])", classDescription.Name, classDescription.ResourceUUID)
+				end
+			end
+		end
+
+		ClassesAndSubclassesMutator.progressionTableMappings = nil
+	end)
+end
+
+
+---@class ClassAbilityOverrides
+---@field rangedAttackAbility AbilityId
+---@field spellCastingAbility AbilityId
+---@field unarmedAttackAbility AbilityId
+
+---@class ClassesConditionalGroup
+---@field classIds {[Guid] : number}?
+---@field spellListDependencies Guid[]?
+---@field numberOfSpellLists number?
+---@field statAbilityOverrides ClassAbilityOverrides?
+
+---@class ClassesAndSubclassesMutator : Mutator
+---@field values ClassesConditionalGroup[]
+
+
+---@type {[Guid] : Guid[]}
+ClassesAndSubclassesMutator.classesAndSubclasses = {}
+
+---@type {[Guid]: string}
+ClassesAndSubclassesMutator.translationMap = {}
+
+function ClassesAndSubclassesMutator:initClassIndex()
+	if not next(self.classesAndSubclasses) then
+		for _, classId in pairs(Ext.StaticData.GetAll("ClassDescription")) do
+			---@type ResourceClassDescription
+			local class = Ext.StaticData.Get(classId, "ClassDescription")
+
+			if class.ParentGuid and class.ParentGuid ~= "00000000-0000-0000-0000-000000000000" and class.ParentGuid ~= "" then
+				if not self.classesAndSubclasses[class.ParentGuid] then
+					self.classesAndSubclasses[class.ParentGuid] = {}
+				end
+
+				table.insert(self.classesAndSubclasses[class.ParentGuid], classId)
+			elseif not self.classesAndSubclasses[classId] then
+				self.classesAndSubclasses[classId] = {}
+			end
+
+			local name = class.DisplayName:Get() or class.Name
+
+			self.translationMap[classId] = name
+		end
+	end
+end
+
+---@param mutator ClassesAndSubclassesMutator
+function ClassesAndSubclassesMutator:renderMutator(parent, mutator)
+	self:initClassIndex()
+	mutator.values = mutator.values or {}
+
+	Helpers:KillChildren(parent)
+
+	local popup = parent:AddPopup("")
+
+	local classTable = Styler:TwoColumnTable(parent)
+	classTable.ColumnDefs[1].Width = 20
+	classTable.BordersV = false
+	classTable.Resizable = false
+	classTable.Borders = false
+	classTable.BordersH = true
+
+	local variantConfig = ConfigurationStructure.config.mutations.settings.classesAndSubclassesDefaultVariants
+
+	for i, classConditionalGroup in ipairs(mutator.values) do
+		local row = classTable:AddRow()
+
+		local delete = Styler:ImageButton(row:AddCell():AddImageButton("delete" .. mutator.targetProperty, "ico_red_x", { 16, 16 }))
+		delete.OnClick = function()
+			for x = i, TableUtils:CountElements(mutator.values) do
+				mutator.values[x].delete = true
+				mutator.values[x] = TableUtils:DeeplyCopyTable(mutator.values._real[x + 1])
+			end
+			Helpers:KillChildren(parent)
+			self:renderMutator(parent, mutator)
+		end
+
+		local groupCell = row:AddCell()
+		local conditionalGroupTable = groupCell:AddTable(tostring(i), 2)
+		conditionalGroupTable.Resizable = true
+
+		local classRow = conditionalGroupTable:AddRow()
+		local classDefCell = classRow:AddCell()
+		---@type ExtuiText
+		local errorText
+
+		local groupTable = classDefCell:AddTable("", 2)
+		groupTable.SizingStretchSame = true
+
+		local headerRow = groupTable:AddRow()
+		headerRow.Headers = true
+		headerRow:AddCell():AddText("Class")
+		headerRow:AddCell():AddText("Level % ( ? )"):Tooltip():AddText([[
+	What % of the selected entity's character level should be used for this class's level (rounded as needed)
+e.g. if a class is set to 75% and the entity's level is 10, they will be level 7 in that specific class
+All %s in this group must add up to 100% - input is disabled if there is only 1 class in the group]])
+
+		if classConditionalGroup.classIds then
+			for classId, levelPercentage in TableUtils:OrderedPairs(classConditionalGroup.classIds, function(_, value)
+				return value
+			end, function(key, value)
+				return Ext.StaticData.Get(key, "ClassDescription") ~= nil
+			end) do
+				classId = variantConfig.vanillaToVariants[classId] or classId
+
+				if not TableUtils:IndexOf(variantConfig.vanillaToVariants, classId) then
+					classId = variantConfig.nameGuidMap[Ext.StaticData.Get(classId, "ClassDescription").Name]
+				end
+
+				---@type ResourceClassDescription
+				local class = Ext.StaticData.Get(classId, "ClassDescription")
+
+				if class then
+					local groupRow = groupTable:AddRow()
+
+					local name = self.translationMap[classId]
+					if self.translationMap[class.ParentGuid] then
+						name = self.translationMap[class.ParentGuid] .. " - " .. name
+					end
+
+					local classCell = groupRow:AddCell()
+					local deleteClass = Styler:ImageButton(classCell:AddImageButton("delete" .. classId, "ico_red_x", { 16, 16 }))
+					deleteClass.OnClick = function()
+						classConditionalGroup.classIds[classId] = nil
+						if TableUtils:CountElements(classConditionalGroup.classIds) ~= 0 then
+							for otherID, otherLevelPercentage in pairs(classConditionalGroup.classIds) do
+								if levelPercentage + otherLevelPercentage <= 100 then
+									classConditionalGroup.classIds[otherID] = otherLevelPercentage + levelPercentage
+									break
+								end
+							end
+						else
+							classConditionalGroup.classIds.delete = true
+						end
+
+						self:renderMutator(parent, mutator)
+					end
+
+					Styler:HyperlinkText(classCell, name, function(parent)
+						ResourceManager:RenderDisplayWindow(Ext.StaticData.Get(classId, "ClassDescription"), parent)
+					end).SameLine = true
+
+					local levelPercentageInput = groupRow:AddCell():AddInputInt("%", levelPercentage)
+					levelPercentageInput.IDContext = classId
+					levelPercentageInput.UserData = classId
+					levelPercentageInput.ItemWidth = Styler:ScaleFactor() * 80
+					levelPercentageInput.SameLine = true
+
+					if TableUtils:CountElements(classConditionalGroup.classIds) == 1 then
+						levelPercentageInput.Disabled = true
+					else
+						levelPercentageInput.OnChange = function()
+							local total = levelPercentageInput.Value[1]
+							for _, childRow in pairs(groupTable.Children) do
+								local input = childRow.Children[2].Children[1]
+								if input.UserData and input.UserData ~= classId then
+									---@cast input ExtuiInputInt
+									total = total + input.Value[1]
+								end
+							end
+
+							if total ~= 100 then
+								errorText.Visible = true
+							else
+								errorText.Visible = false
+							end
+						end
+
+						levelPercentageInput.OnDeactivate = function()
+							if levelPercentageInput.Value[1] < 0 then
+								levelPercentageInput.Value = { 0, 0, 0, 0 }
+							end
+
+							local total = levelPercentageInput.Value[1]
+							for _, childRow in pairs(groupTable.Children) do
+								local input = childRow.Children[2].Children[1]
+								if input.UserData and input.UserData ~= classId then
+									---@cast input ExtuiInputInt
+									total = total + input.Value[1]
+								end
+							end
+
+							if total ~= 100 then
+								errorText.Visible = true
+							else
+								for _, childRow in pairs(groupTable.Children) do
+									local input = childRow.Children[2].Children[1]
+									if input.UserData then
+										---@cast input ExtuiInputInt
+										classConditionalGroup.classIds[input.UserData] = input.Value[1]
+									end
+								end
+
+								self:renderMutator(parent, mutator)
+							end
+						end
+					end
+				end
+			end
+		end
+
+		errorText = classDefCell:AddText("All %s must add up to 100%!")
+		-- Red
+		errorText:SetColor("Text", { 1, 0.02, 0, 1 })
+		errorText.Visible = false
+
+		groupCell:AddButton("Add Class").OnClick = function()
+			Helpers:KillChildren(popup)
+			popup:Open()
+
+			for classId, subclasses in TableUtils:OrderedPairs(self.classesAndSubclasses, function(key, value)
+				return self.translationMap[key]
+			end, function(key, value)
+				return variantConfig.vanillaToVariants[key] == nil
+			end) do
+				if next(subclasses) then
+					---@type ExtuiMenu
+					local menu = popup:AddMenu(self.translationMap[classId])
+					menu.Disabled = (classConditionalGroup.classIds and classConditionalGroup.classIds[classId]) ~= nil
+
+					menu:AddSelectable(self.translationMap[classId]).OnClick = function()
+						classConditionalGroup.classIds = classConditionalGroup.classIds or {}
+						classConditionalGroup.classIds[classId] = TableUtils:CountElements(classConditionalGroup.classIds) == 0 and 100 or 0
+
+						self:renderMutator(parent, mutator)
+					end
+
+					for _, subclassId in TableUtils:OrderedPairs(subclasses, function(key, value)
+						return self.translationMap[value]
+					end) do
+						if not menu.Disabled then
+							menu.Disabled = (classConditionalGroup.classIds and classConditionalGroup.classIds[subclassId]) ~= nil
+						end
+
+						menu:AddSelectable(self.translationMap[subclassId]).OnClick = function()
+							classConditionalGroup.classIds = classConditionalGroup.classIds or {}
+							classConditionalGroup.classIds[subclassId] = TableUtils:CountElements(classConditionalGroup.classIds) == 0 and 100 or 0
+
+							self:renderMutator(parent, mutator)
+						end
+					end
+
+					if menu.Disabled then
+						menu:SetStyle("Alpha", 0.5)
+					end
+				end
+			end
+		end
+
+		local conditionalCell = classRow:AddCell()
+
+		local inputToPreventOffset = conditionalCell:AddInputInt("")
+		inputToPreventOffset:SetStyle("Alpha", 0)
+		inputToPreventOffset.ItemWidth = 0
+
+		conditionalCell:AddText("Must have been assigned ").SameLine = true
+		local spellListNumberInput = conditionalCell:AddInputInt("", classConditionalGroup.numberOfSpellLists or 0)
+		spellListNumberInput.ItemWidth = Styler:ScaleFactor() * 40
+		spellListNumberInput.SameLine = true
+		spellListNumberInput.OnDeactivate = function()
+			if spellListNumberInput.Value[1] < 0 then
+				spellListNumberInput.Value = { 0, 0, 0, 0 }
+			end
+			classConditionalGroup.numberOfSpellLists = spellListNumberInput.Value[1]
+		end
+
+		conditionalCell:AddText(" or more of the following Spell Lists:").SameLine = true
+
+		if classConditionalGroup.spellListDependencies then
+			for i, spellListId in TableUtils:OrderedPairs(classConditionalGroup.spellListDependencies, function(key, value)
+					return MutationConfigurationProxy.lists.spellLists[value].name
+				end,
+				function(key, value)
+					return MutationConfigurationProxy.lists.spellLists[value] ~= nil
+				end)
+			do
+				local delete = Styler:ImageButton(conditionalCell:AddImageButton("delete" .. spellListId, "ico_red_x", { 16, 16 }))
+				delete.OnClick = function()
+					for x = i, TableUtils:CountElements(classConditionalGroup.spellListDependencies) do
+						classConditionalGroup.spellListDependencies[x] = classConditionalGroup.spellListDependencies[x + 1]
+					end
+
+					self:renderMutator(parent, mutator)
+				end
+
+				local spellList = MutationConfigurationProxy.lists.spellLists[spellListId]
+				local spellListLink = conditionalCell:AddTextLink(spellList.name .. (spellList.modId and string.format(" (%s)", Ext.Mod.GetMod(spellList.modId).Info.Name) or ""))
+				spellListLink.IDContext = spellListId
+				spellListLink.SameLine = true
+				spellListLink.OnClick = function()
+					SpellListDesigner:launch(spellListId)
+				end
+			end
+		end
+
+		conditionalCell:AddButton("Add Spell List").OnClick = function()
+			Helpers:KillChildren(popup)
+			popup:Open()
+
+			for spellListId, spellList in TableUtils:OrderedPairs(MutationConfigurationProxy.lists.spellLists, function(key, value)
+				return value.name .. (value.modId and string.format(" (%s)", Ext.Mod.GetMod(value.modId).Info.Name) or "")
+			end) do
+				---@type ExtuiSelectable
+				local select = popup:AddSelectable(spellList.name .. (spellList.modId and string.format(" (%s)", Ext.Mod.GetMod(spellList.modId).Info.Name) or ""))
+				select.Selected = TableUtils:IndexOf(classConditionalGroup.spellListDependencies, spellListId) ~= nil
+				select.OnClick = function()
+					-- selected is flipped by the time this fires
+					if not select.Selected then
+						for x = TableUtils:IndexOf(classConditionalGroup.spellListDependencies, spellListId), TableUtils:CountElements(classConditionalGroup.spellListDependencies) do
+							classConditionalGroup.spellListDependencies[x] = classConditionalGroup.spellListDependencies[x + 1]
+						end
+					else
+						classConditionalGroup.spellListDependencies = classConditionalGroup.spellListDependencies or {}
+						table.insert(classConditionalGroup.spellListDependencies, spellListId)
+					end
+					self:renderMutator(parent, mutator)
+				end
+			end
+		end
+
+		conditionalCell:AddSeparatorText("Ability Overrides ( ? )"):Tooltip():AddText("\t If any of the below are not specified, the entity's default value will be preserved")
+		local abilities = { "None", "Strength", "Dexterity", "Constitution", "Intelligence", "Wisdom", "Charisma", "Sentinel" }
+
+		local abilityOverrideTable = conditionalCell:AddTable("AbilityOverride", 2)
+		abilityOverrideTable.SizingFixedFit = true
+
+		local abilityFields = {
+			{ label = "Spell Casting Ability",  field = "spellCastingAbility" },
+			{ label = "Ranged Attack Ability",  field = "rangedAttackAbility" },
+			{ label = "Unarmed Attack Ability", field = "unarmedAttackAbility" }
+		}
+
+		for _, abilityConfig in ipairs(abilityFields) do
+			local row = abilityOverrideTable:AddRow()
+			row:AddCell():AddText(abilityConfig.label)
+			local combo = row:AddCell():AddCombo("")
+			combo.WidthFitPreview = true
+			combo.Options = abilities
+			combo.SelectedIndex = (classConditionalGroup.statAbilityOverrides
+				and TableUtils:IndexOf(abilities, classConditionalGroup.statAbilityOverrides[abilityConfig.field])
+				or 0) - 1
+
+			combo.OnChange = function()
+				local val = combo.Options[combo.SelectedIndex + 1]
+				if val == "None" then
+					if classConditionalGroup.statAbilityOverrides then
+						classConditionalGroup.statAbilityOverrides[abilityConfig.field] = nil
+						if not classConditionalGroup.statAbilityOverrides() then
+							classConditionalGroup.statAbilityOverrides.delete = true
+						end
+					end
+					combo.SelectedIndex = -1
+				else
+					classConditionalGroup.statAbilityOverrides = classConditionalGroup.statAbilityOverrides or {}
+					classConditionalGroup.statAbilityOverrides[abilityConfig.field] = val
+				end
+			end
+		end
+	end
+
+	parent:AddButton("Add Class Group").OnClick = function()
+		table.insert(mutator.values, {})
+		self:renderMutator(parent, mutator)
+	end
+end
+
+---@param mutator ClassesAndSubclassesMutator
+function ClassesAndSubclassesMutator:handleDependencies(_, mutator, removeMissingDependencies)
+	if not mutator.values then
+		return
+	end
+	local classesIndex = Ext.StaticData.GetSources("ClassDescription")
+
+	local variantConfig = ConfigurationStructure.config.mutations.settings.classesAndSubclassesDefaultVariants
+
+	for c, classGroup in pairs(mutator.values) do
+		if classGroup.classIds then
+			for classId in pairs(classGroup.classIds) do
+				classId = TableUtils:IndexOf(variantConfig.vanillaToVariants, classId) or classId
+
+				---@type ResourceClassDescription
+				local class = Ext.StaticData.Get(classId, "ClassDescription")
+				if not class then
+					classGroup.classIds[classId] = nil
+					if not next(classGroup.classIds._real or classGroup.classIds) then
+						mutator.values[c].delete = true
+						mutator.values[c] = nil
+					end
+				elseif not removeMissingDependencies then
+					local classSource = TableUtils:IndexOf(classesIndex, function(value)
+						return TableUtils:IndexOf(value, classId) ~= nil
+					end)
+					if classSource then
+						mutator.modDependencies = mutator.modDependencies or {}
+						if not mutator.modDependencies[classSource] then
+							local name, author, version = Helpers:BuildModFields(classSource)
+							if author == "Larian" then
+								goto continue
+							end
+							mutator.modDependencies[classSource] = {
+								modName = name,
+								modAuthor = author,
+								modVersion = version,
+								modId = classSource,
+								packagedItems = {}
+							}
+						end
+
+						mutator.modDependencies[classSource].packagedItems[classId] = class.DisplayName:Get() or class.Name
+					end
+					::continue::
+				end
+			end
+		end
+	end
+	TableUtils:ReindexNumericTable(mutator.values)
+end
+
+function ClassesAndSubclassesMutator:undoMutator(entity, entityVar)
+	entity.Classes.Classes = {}
+	if entityVar.originalValues[self.name] then
+		for _, classDef in pairs(entityVar.originalValues[self.name].classes) do
+			---@cast classDef ClassInfo
+			entity.Classes.Classes[#entity.Classes.Classes + 1] = {
+				ClassUUID = classDef.ClassUUID,
+				SubClassUUID = classDef.SubClassUUID,
+				Level = classDef.Level
+			}
+		end
+
+		Logger:BasicDebug("Reverted classes to %s", entityVar.originalValues[self.name].classes)
+	end
+
+	if entityVar.originalValues[self.name].spellCastingAbility then
+		Logger:BasicDebug("Reverted spellCastingAbility to %s", entityVar.originalValues[self.name].spellCastingAbility)
+		entity.Stats.SpellCastingAbility = entityVar.originalValues[self.name].spellCastingAbility
+	end
+
+	if entityVar.originalValues[self.name].rangedAttackAbility then
+		Logger:BasicDebug("Reverted rangedAttackAbility to %s", entityVar.originalValues[self.name].rangedAttackAbility)
+		entity.Stats.RangedAttackAbility = entityVar.originalValues[self.name].rangedAttackAbility
+	end
+
+	if entityVar.originalValues[self.name].unarmedAttackAbility then
+		Logger:BasicDebug("Reverted unarmedAttackAbility to %s", entityVar.originalValues[self.name].unarmedAttackAbility)
+		entity.Stats.UnarmedAttackAbility = entityVar.originalValues[self.name].unarmedAttackAbility
+	end
+end
+
+function ClassesAndSubclassesMutator:applyMutator(entity, entityVar)
+	local classesMutators = entityVar.appliedMutators[self.name]
+	if not classesMutators[1] then
+		classesMutators = { classesMutators }
+	end
+	---@cast classesMutators ClassesAndSubclassesMutator[]
+
+	---@type ClassesConditionalGroup[]
+	local chosenClassGroups = {}
+
+	local variantConfig = ConfigurationStructure.config.mutations.settings.classesAndSubclassesDefaultVariants
+
+	for _, classesMutator in TableUtils:OrderedPairs(classesMutators) do
+		for _, classConditonal in TableUtils:OrderedPairs(classesMutator.values) do
+			if classConditonal.numberOfSpellLists and classConditonal.numberOfSpellLists > 0 then
+				if classConditonal.spellListDependencies and next(classConditonal.spellListDependencies) then
+					local numberMatched = 0
+					if entityVar.appliedMutators[SpellListMutator.name] and entityVar.appliedMutators[SpellListMutator.name].appliedLists then
+						for appliedSpellListId in pairs(entityVar.appliedMutators[SpellListMutator.name].appliedLists) do
+							if TableUtils:IndexOf(classConditonal.spellListDependencies, appliedSpellListId) then
+								numberMatched = numberMatched + 1
+							end
+						end
+					end
+
+					if numberMatched < classConditonal.numberOfSpellLists then
+						Logger:BasicDebug("Skipping a class group because the number of matched spell lists, %s, is less than the defined minimum %s",
+							numberMatched,
+							classConditonal.numberOfSpellLists)
+
+						goto continue
+					else
+						for classId in pairs(classConditonal.classIds) do
+							if not Ext.StaticData.Get(classId, "ClassDescription") then
+								Logger:BasicDebug("Skipping a class group because one of the classIds does not exist. ClassId: %s", classId)
+
+								goto continue
+							end
+						end
+					end
+				else
+					Logger:BasicWarning("Skipping a Classes and Subclasses mutator spellList check because no spellLists were added to it despite specifying a number: %s",
+						classConditonal)
+				end
+			end
+			table.insert(chosenClassGroups, classConditonal)
+			::continue::
+		end
+	end
+
+	if next(chosenClassGroups) then
+		Logger:BasicDebug("%s potential class groups were identified - randomly choosing one", #chosenClassGroups)
+		---@type ClassesConditionalGroup
+		local classGroup = chosenClassGroups[math.random(#chosenClassGroups)]
+		if classGroup.classIds then
+			entityVar.originalValues[self.name] = {
+				classes = TableUtils:DeeplyCopyTable(Ext.Types.Serialize(entity.Classes.Classes))
+			}
+
+			entity.Classes.Classes = {}
+
+			local classesLeft = TableUtils:CountElements(classGroup.classIds)
+			local classLevelsLeft = entity.AvailableLevel.Level
+			for classId, levelPercentage in TableUtils:OrderedPairs(classGroup.classIds, nil, function(key, value)
+				return Ext.StaticData.Get(key, "ClassDescription") ~= nil
+			end) do
+				classId = variantConfig.vanillaToVariants[classId] or classId
+
+				if not TableUtils:IndexOf(variantConfig.vanillaToVariants, classId) then
+					classId = variantConfig.nameGuidMap[Ext.StaticData.Get(classId, "ClassDescription").Name]
+				end
+
+				---@type ResourceClassDescription
+				local class = Ext.StaticData.Get(classId, "ClassDescription")
+				if class then
+					local hasParentClass = Ext.StaticData.Get(class.ParentGuid, "ClassDescription") ~= nil
+
+					if classesLeft == 1 then
+						entity.Classes.Classes[#entity.Classes.Classes + 1] = {
+							ClassUUID = hasParentClass and class.ParentGuid or classId,
+							Level = classLevelsLeft,
+							SubClassUUID = hasParentClass and classId or nil
+						}
+						Logger:BasicDebug("Added class %s at level %s", class.DisplayName:Get() or class.Name, classLevelsLeft)
+					else
+						local desiredClassLevel = math.ceil(entity.AvailableLevel.Level * (levelPercentage / 100))
+						if desiredClassLevel > 0 then
+							entity.Classes.Classes[#entity.Classes.Classes + 1] = {
+								ClassUUID = hasParentClass and class.ParentGuid or classId,
+								Level = desiredClassLevel,
+								SubClassUUID = hasParentClass and classId or nil
+							}
+
+							Logger:BasicDebug("Added class %s at level %s", class.DisplayName:Get() or class.Name, desiredClassLevel)
+							classLevelsLeft = classLevelsLeft - desiredClassLevel
+						end
+					end
+
+					classesLeft = classesLeft - 1
+					if classLevelsLeft == 0 then
+						break
+					end
+				end
+			end
+
+			if classGroup.statAbilityOverrides then
+				if classGroup.statAbilityOverrides.spellCastingAbility and entity.Stats.SpellCastingAbility ~= classGroup.statAbilityOverrides.spellCastingAbility then
+					entityVar.originalValues[self.name].spellCastingAbility = entity.Stats.SpellCastingAbility
+					entity.Stats.SpellCastingAbility = classGroup.statAbilityOverrides.spellCastingAbility
+				end
+
+				if classGroup.statAbilityOverrides.rangedAttackAbility and entity.Stats.RangedAttackAbility ~= classGroup.statAbilityOverrides.rangedAttackAbility then
+					entityVar.originalValues[self.name].rangedAttackAbility = entity.Stats.RangedAttackAbility
+					entity.Stats.RangedAttackAbility = classGroup.statAbilityOverrides.rangedAttackAbility
+				end
+
+				if classGroup.statAbilityOverrides.unarmedAttackAbility and entity.Stats.UnarmedAttackAbility ~= classGroup.statAbilityOverrides.unarmedAttackAbility then
+					entityVar.originalValues[self.name].unarmedAttackAbility = entity.Stats.UnarmedAttackAbility
+					entity.Stats.UnarmedAttackAbility = classGroup.statAbilityOverrides.unarmedAttackAbility
+				end
+			end
+		end
+
+		if not next(Ext.Types.Serialize(entity.Classes.Classes)) then
+			Logger:BasicDebug("No valid classes were assigned - likely the mutation has classes that aren't loaded. Reverting component back to original")
+			for _, classDef in pairs(entityVar.originalValues[self.name].classes) do
+				---@cast classDef ClassInfo
+				entity.Classes.Classes[#entity.Classes.Classes + 1] = {
+					ClassUUID = classDef.ClassUUID,
+					SubClassUUID = classDef.SubClassUUID,
+					Level = classDef.Level
+				}
+			end
+		end
+	else
+		Logger:BasicDebug("No class groups were chosen - finishing early")
+	end
+end
+
+function ClassesAndSubclassesMutator:FinalizeMutator(entity)
+	entity:Replicate("Classes")
+	entity:Replicate("Stats")
+end
+
+---@return MazzleDocsDocumentation
+function ClassesAndSubclassesMutator:generateDocs()
+	return {
+		{
+			Topic = self.Topic,
+			SubTopic = self.SubTopic,
+			content = {
+				{
+					type = "Heading",
+					text = "Classes And Subclasses",
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "CallOut",
+					prefix = "",
+					prefix_color = "Yellow",
+					text = [[
+Dependency On: Spell Lists
+Transient: Yes
+Composable: Yes - Class Groups will be combined into one pool and one will be randomly chosen (post filtering)]]
+				} --[[@as MazzleDocsCallOut]],
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Summary"
+				},
+				{
+					type = "Content",
+					text =
+					[[Functionally speaking, Classes have very little impact on gameplay functionality - as far as I'm aware, it only matters for specific spells that check Class level instead of entity level.
+Still, it's good flavour, useful in those cases, and a valuable dependency for the Action Resources Mutator, so here we are.]]
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Client-Side Content"
+				},
+				{
+					type = "Content",
+					text = [[
+The mutator is laid out as follows:
+
+----
+
+Class Groups: Configured on the left hand side, this section contains a list of classes that should _all_ be assigned to the entity, adding up to 100% of the entity's Level (per the EocLevel component).
+You can add multiple subclasses from one main class, but if you add the Main class you won't be allowed to add any subclasses from it.]]
+				},
+				{
+					type = "CallOut",
+					prefix = "NPC Class Variants",
+					color = "Green",
+					prefix_color = "Green",
+					text =
+					[[Lab dynamically creates NPC Variants of all (Sub)Classes to assign to entities that _must_ be used - the only difference between these and their source definitions is that the BaseHp and HpPerLevel properties are zeroed out, preventing any Health modifications.]]
+				} --[[@as MazzleDocsCallOut]],
+				{
+					type = "Content",
+					text = [[
+The reasoning for the variants is: Classes defined in the underlying game files are given BaseHp and HpPerLevel properties, which increase the entity's HP by the respective calculations.
+
+This is problematic for Lab's purposes as those calculations don't actually execute when the class component is updated, or when HP properties are requested; the only identified trigger was when a MaxHP boost was applied to the entity, which, guess what, really messed with the HealthMutator math, leading to confusing an undesirable results.
+
+To solve this, the NPC (Sub)Class variants are dynamically created every time the game is started/an honour-ruleset save is loaded for the first time since startup (and their ResourceUUIDs stored to the config, for consistency), and Lab handles mapping between the source and the variants.
+This means when exporting your profile, you'll be exporting the Source Classes so the proper mod dependencies can be recorded, and using the Variant Classes when importing/executing these mutators (with Lab ensuring that Class mutators that were created by different authors using the same Class Mod use the same Variant).
+
+----
+
+Modifiers Section: On the right hand side you'll find two modifiers:
+
+	Spell List Dependencies - this is a simple dependency that stats the entity must have been assigned at least 1 level of the specific amount of lists from the dependency pool - for example, you can specify that the group should only apply if the entity had the Bard AND Wizard spell lists applied, _or_ the Bard OR the Wizard lists, allowing for precise multi-class control.
+	
+	Ability Overrides: Allows specifying what ability the entity should use for the applicable rolls, otherwise whatever is currently on the entity will be used (can be found under the Stats component on the Entity in the Inspector).
+		
+
+The rest of the Mutator UI is explained via tooltips to avoid duplicated info and inevitable deprecation of information.]]
+				},
+				{
+					type = "Separator"
+				},
+				{
+					type = "SubHeading",
+					text = "Server-Side Implementation"
+				},
+				{
+					type = "Content",
+					text =
+					[[When setting the classes, the `Classes.Classes` component is overwritten entirely; any specified Abilities overwrite their respective Stat component property: SpellCastingAbility, RangedAttackAbility, UnarmedAttackAbility. ]]
+				}
+			}
+		}
+	} --[[@as MazzleDocsDocumentation]]
+end
+
+---@return {[string]: MazzleDocsContentItem}
+function ClassesAndSubclassesMutator:generateChangelog()
+	return {
+		["1.12.0"] = {
+			type = "Bullet",
+			text = {
+				"Server: Excludes class groups that contain classes that don't exist from the pool"
+			}
+		},
+		["1.10.12"] = {
+			type = "Bullet",
+			text = {
+				"Adds more error handling when creating NPC variants of (sub)classes",
+				"Adds workaround for classes that have an empty DisplayName",
+				"Fix when exporting/importing an empty class group"
+			}
+		},
+		["1.10.11"] = {
+			type = "Bullet",
+			text = {
+				"Introduces workaround for CompatibilityFramework error that prevents removing NPC-variants of classes",
+			}
+		},
+		["1.10.5"] = {
+			type = "Bullet",
+			text = {
+				"Sets 'IsDefaultForUseSpellAction' to false on all NPC class variants, preventing inconsistent issues with using items like Arrows (s/o Focus for this, this was super niche)",
+			}
+		},
+		["1.9.3"] = {
+			type = "Bullet",
+			text = {
+				"Prevents Subclass variants from showing up in level up screen when CompatibilityFramework is loaded (as of release, there are a few modded subclasses that CF fails to remove - it's been reported, wait for an update from CF)",
+				"Added resiliency checks when a mutation specifies a class that isn't in the game"
+			}
+		},
+		["1.9.1"] = {
+			type = "Bullet",
+			text = {
+				"Clears Progression UUID from NPC Class variants, preventing them from showing up in Character Creation/Level Up Screens",
+			}
+		},
+		["1.9.0"] = {
+			type = "Bullet",
+			text = {
+				"Introduces NPC variants of all Classes that wipe out BaseHp and HpPerLevel properties, allowing for consistency and predictability in Health behavior (backwards compatible, Lab handles internal mapping)",
+			}
+		},
+		["1.8.1"] = {
+			type = "Bullet",
+			text = {
+				"Fixes an error when a class in the config isn't present in the game",
+			}
+		},
+		["1.7.0"] = {
+			type = "Bullet",
+			text = {
+				"Slightly widens inputs and makes sure UI elements scale appropriately",
+				"Changes from Transient to _not_ transient, allowing Lab to undo the changes itself"
+			}
+		}
+	} --[[@as {[string]: MazzleDocsContentItem}]]
+end
